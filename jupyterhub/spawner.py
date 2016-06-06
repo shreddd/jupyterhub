@@ -10,6 +10,7 @@ import pwd
 import signal
 import sys
 import grp
+import time
 import warnings
 from subprocess import Popen
 from tempfile import mkdtemp
@@ -24,6 +25,8 @@ from traitlets import (
 
 from .traitlets import Command
 from .utils import random_port
+
+import paramiko
 
 class Spawner(LoggingConfigurable):
     """Base class for spawning single-user notebook servers.
@@ -548,3 +551,138 @@ class LocalProcessSpawner(Spawner):
             # it all failed, zombie process
             self.log.warning("Process %i never died", self.pid)
     
+
+
+class SSHSpawner(Spawner):
+    remote_host = "cori19-224.nersc.gov"
+    pid = None
+    client = Instance(paramiko.client.SSHClient)
+
+
+    def execute(self, command):
+
+
+
+        self.client = paramiko.client.SSHClient()
+        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self.client.load_system_host_keys()
+        self.client.connect(self.remote_host)
+        print(command)
+
+        stdin, stdout, stderr = self.client.exec_command(command)
+
+        return (stdin, stdout, stderr)
+
+    def user_env(self):
+
+        env = super(SSHSpawner, self).get_env()
+        env.update(dict(
+            JPY_USER=self.user.name,
+            JPY_COOKIE_NAME=self.user.server.cookie_name,
+            JPY_BASE_URL=self.user.server.base_url,
+            JPY_HUB_PREFIX=self.hub.server.base_url
+        ))
+
+        if self.notebook_dir:
+            env['NOTEBOOK_DIR'] = self.notebook_dir
+
+        hub_api_url = self.hub.api_url
+        env['JPY_HUB_API_URL'] = hub_api_url
+
+        return env
+
+
+    def exec_notebook(self, command):
+        env = self.user_env()
+        for item in env.items():
+            command = ('export %s="%s";' % item) + command
+
+
+        # command = 'export JPY_API_TOKEN="%s";' % env['JPY_API_TOKEN']  + command
+        #command = 'module load shifter;shifter --image=docker:registry.services.nersc.gov/jupyternersc:latest ' + command
+        command = command + '& pid=$!; echo $pid'
+        stdin, stdout, stderr = self.execute(command)
+        print("status=%d" % stdout.channel.recv_exit_status())
+
+        pid = int(stdout.readline())
+
+        return pid
+
+    def remote_random_port(self):
+        command="python -c \"import socket; sock = socket.socket(); sock.bind(('', 0)); print sock.getsockname()[1]; sock.close()\""
+        stdin, stdout, stderr = self.execute(command)
+        print("status=%d" % stdout.channel.recv_exit_status())
+        print(stderr.readline())
+
+        port = int(stdout.readline())
+        return port
+
+
+    def remote_signal(self, sig):
+        """simple implementation of signal, which we can use when we are using setuid (we are root)"""
+        command = 'kill -s %s %d' % (sig, self.pid)
+        stdin, stdout, stderr = self.execute(command)
+        status = stdout.channel.recv_exit_status()
+        return (status==0)
+
+
+    @gen.coroutine
+    def start(self):
+        """Start the process"""
+        self.user.server.ip = self.remote_host
+        self.user.server.port = self.remote_random_port()
+        cmd = []
+        env = self.get_env()
+        
+        cmd.extend(self.cmd)
+        cmd.extend(self.get_args())
+
+        remote_cmd = ' '.join(cmd)
+        
+
+        # time.sleep(2)
+        # import pdb; pdb.set_trace()
+
+        self.pid = self.exec_notebook(remote_cmd)
+
+    @gen.coroutine
+    def poll(self):
+        if not self.pid:
+            # no pid, not running
+            self.clear_state()
+            return 0
+        
+        # send signal 0 to check if PID exists
+        alive = self.remote_signal(0)
+        if not alive:
+            self.clear_state()
+            return 0
+        else:
+            return None
+
+    @gen.coroutine
+    def stop(self):
+
+        alive = self.remote_signal(15)
+
+        self.clear_state()
+
+
+    def get_state(self):
+        """get the current state"""
+        state = super().get_state()
+        if self.pid:
+            state['pid'] = self.pid
+        return state
+
+    def load_state(self, state):
+        """load state from the database"""
+        super().load_state(state)
+        if 'pid' in state:
+            self.pid = state['pid']
+
+    def clear_state(self):
+        """clear any state (called after shutdown)"""
+        super().clear_state()
+        self.pid = 0
+
