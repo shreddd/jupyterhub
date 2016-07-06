@@ -554,19 +554,23 @@ class LocalProcessSpawner(Spawner):
 
 
 class SSHSpawner(Spawner):
-    remote_host = "cori19-224.nersc.gov"
+    remote_host = "corigrid.nersc.gov"
     pid = None
     client = Instance(paramiko.client.SSHClient)
 
 
     def execute(self, command):
 
-
+        # import getpass
+        # print("currently logged in as: " + getpass.getuser()) 
 
         self.client = paramiko.client.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         self.client.load_system_host_keys()
-        self.client.connect(self.remote_host)
+
+        key = paramiko.RSAKey.from_private_key_file("/root/.ssh/id_rsa_jupyter")
+
+        self.client.connect(self.remote_host, username=self.user.name, pkey=key)
         print(command)
 
         stdin, stdout, stderr = self.client.exec_command(command)
